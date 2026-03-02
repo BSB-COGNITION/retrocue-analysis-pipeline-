@@ -1,0 +1,311 @@
+# ==============================================================================
+# 02_mixture_model_simulation.R
+# Bayesian Mixture Model: Simulating and Analyzing Continuous Recall Errors
+# 
+# Purpose: Simulate retro-cue continuous recall data with von Mises target 
+#          responses, swap errors, and uniform guessing. Fit the 3-component 
+#          mixture model and test whether Processing Efficiency moderates 
+#          precision (kappa) and swap errors (p_swap) under distractor conditions.
+#
+# Author:  Bidyasundar Baksi
+# Date:    2026-02-28
+# ==============================================================================
+
+# --- 1. Setup -----------------------------------------------------------------
+
+library(tidyverse)
+library(circular)
+library(patchwork)
+
+set.seed(42)
+
+# --- 2. Simulation Parameters ------------------------------------------------
+
+N_sub      <- 60       # Participants (reduced from 200 for speed)
+N_trials   <- 80       # Trials per condition per participant
+set_size   <- 4        # Memory array size
+
+# True mixture parameters (population means)
+# No-distractor condition
+kappa_base     <- 8     # Precision (concentration of von Mises)
+p_target_base  <- 0.70  # P(target response)
+p_swap_base    <- 0.15  # P(swap error)
+p_guess_base   <- 0.15  # P(random guess)
+
+# Distractor condition: similar 15-degree distractor degrades performance
+kappa_dist     <- 5     # Lower precision
+p_target_dist  <- 0.60  # More errors
+p_swap_dist    <- 0.25  # More swaps (the key prediction)
+p_guess_dist   <- 0.15
+
+cat("=== Simulation Parameters ===\n")
+cat(sprintf("N = %d participants, %d trials/condition\n", N_sub, N_trials))
+cat(sprintf("Set size = %d\n\n", set_size))
+
+# --- 3. Simulate AC Factor Scores --------------------------------------------
+
+# Processing Efficiency (standardized, from CFA Step 1)
+efficiency_z <- rnorm(N_sub, mean = 0, sd = 1)
+
+cat("Processing Efficiency scores: M =", round(mean(efficiency_z), 2), 
+    "SD =", round(sd(efficiency_z), 2), "\n\n")
+
+# --- 4. Generate Trial-Level Data --------------------------------------------
+
+simulate_participant <- function(sub_id, eff_z) {
+  # Effect of Processing Efficiency on mixture parameters
+  # Higher efficiency -> better precision & fewer swaps under distraction
+  eff_effect_kappa  <- 2.0   # Efficiency-dependent gain in kappa
+  eff_effect_pswap  <- -0.08 # Efficiency-dependent reduction in p_swap
+  
+  conditions <- c("no_distractor", "distractor_15deg")
+  
+  trials <- lapply(conditions, function(cond) {
+    if (cond == "no_distractor") {
+      kappa_i   <- kappa_base + rnorm(1, 0, 0.5)
+      p_target_i <- p_target_base
+      p_swap_i   <- p_swap_base
+    } else {
+      # Distractor condition: efficiency modulates the effect
+      kappa_i   <- kappa_dist + eff_z * eff_effect_kappa + rnorm(1, 0, 0.5)
+      p_target_i <- p_target_dist
+      p_swap_i   <- max(0.01, p_swap_dist + eff_z * eff_effect_pswap)
+    }
+    
+    kappa_i <- max(1, kappa_i)  # Floor at 1
+    p_guess_i <- max(0.01, 1 - p_target_i - p_swap_i)
+    
+    # Normalize probabilities
+    probs <- c(p_target_i, p_swap_i, p_guess_i)
+    probs <- probs / sum(probs)
+    
+    # Generate each trial
+    lapply(1:N_trials, function(t) {
+      # Random target orientation
+      target_orient <- runif(1, -pi, pi)
+      
+      # Non-target orientations (3 others)
+      nt_orients <- runif(set_size - 1, -pi, pi)
+      
+      # Which response type?
+      resp_type <- sample(c("target", "swap", "guess"), 1, prob = probs)
+      
+      if (resp_type == "target") {
+        # Von Mises centered on target
+        response <- as.numeric(rvonmises(1, circular(target_orient), kappa_i))
+      } else if (resp_type == "swap") {
+        # Von Mises centered on a random non-target
+        swap_item <- sample(1:(set_size - 1), 1)
+        response <- as.numeric(rvonmises(1, circular(nt_orients[swap_item]), kappa_i))
+      } else {
+        # Uniform guess
+        response <- runif(1, -pi, pi)
+      }
+      
+      # Recall error = response - target (wrapped to [-pi, pi])
+      error <- ((response - target_orient + pi) %% (2 * pi)) - pi
+      
+      tibble(
+        subject     = sub_id,
+        trial       = t,
+        condition   = cond,
+        distractor  = ifelse(cond == "distractor_15deg", 1, 0),
+        target_rad  = target_orient,
+        response_rad = response,
+        recall_error = error,
+        error_deg   = error * 180 / pi,
+        nt1 = nt_orients[1] - target_orient,
+        nt2 = nt_orients[2] - target_orient,
+        nt3 = nt_orients[3] - target_orient,
+        true_type   = resp_type,
+        efficiency_z = eff_z
+      )
+    }) %>% bind_rows()
+  }) %>% bind_rows()
+  
+  return(trials)
+}
+
+# Generate all data
+cat("Simulating trial-level data...\n")
+sim_data <- map2_dfr(1:N_sub, efficiency_z, simulate_participant)
+
+cat(sprintf("Total trials: %d\n", nrow(sim_data)))
+cat(sprintf("Participants: %d\n", length(unique(sim_data$subject))))
+cat(sprintf("Conditions: %s\n\n", paste(unique(sim_data$condition), collapse = ", ")))
+
+# --- 5. Visualize Recall Error Distributions ----------------------------------
+
+# Overall error distributions by condition
+p_errors <- ggplot(sim_data, aes(x = error_deg, fill = condition)) +
+  geom_histogram(bins = 72, alpha = 0.6, position = "identity") +
+  facet_wrap(~condition, ncol = 1) +
+  scale_fill_manual(values = c("no_distractor" = "#27AE60", 
+                                 "distractor_15deg" = "#E74C3C")) +
+  labs(
+    title = "Recall Error Distributions",
+    subtitle = "Narrower = more precise; flat tails = guessing",
+    x = "Recall Error (degrees)",
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# Error by efficiency quartile (distractor condition only)
+sim_data <- sim_data %>%
+  mutate(eff_quartile = ntile(efficiency_z, 4))
+
+p_quartile <- sim_data %>%
+  filter(distractor == 1) %>%
+  ggplot(aes(x = error_deg, fill = factor(eff_quartile))) +
+  geom_histogram(bins = 72, alpha = 0.7) +
+  facet_wrap(~eff_quartile, ncol = 2, 
+             labeller = labeller(eff_quartile = c("1" = "Low Efficiency",
+                                                    "2" = "Mid-Low",
+                                                    "3" = "Mid-High",
+                                                    "4" = "High Efficiency"))) +
+  scale_fill_brewer(palette = "YlOrRd", direction = -1) +
+  labs(
+    title = "Distractor Condition: Error by Processing Efficiency Quartile",
+    subtitle = "H2 prediction: high efficiency = narrower distribution",
+    x = "Recall Error (degrees)", y = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+print(p_errors)
+print(p_quartile)
+
+# --- 6. Maximum Likelihood Mixture Model (Manual Implementation) --------------
+
+# 3-component mixture model: target (von Mises) + swap (von Mises) + guess (uniform)
+# This demonstrates the math before using the bmm package
+
+nll_mixture3p <- function(par, errors, nt_errors) {
+  # Parameters
+  kappa   <- exp(par[1])         # Precision (positive)
+  p_t     <- plogis(par[2])      # P(target) via logistic
+  p_s_raw <- plogis(par[3])      # P(swap) conditional
+  p_s     <- p_s_raw * (1 - p_t)
+  p_g     <- 1 - p_t - p_s       # P(guess)
+  
+  # Likelihoods
+  ll_target <- suppressWarnings(
+    dvonmises(circular(errors), circular(0), kappa)
+  )
+  
+  # Swap: average over non-target distances
+  ll_swap <- rowMeans(sapply(1:ncol(nt_errors), function(j) {
+    suppressWarnings(
+      dvonmises(circular(errors - nt_errors[, j]), circular(0), kappa)
+    )
+  }))
+  
+  ll_guess <- 1 / (2 * pi)
+  
+  # Mixture likelihood
+  ll <- p_t * ll_target + p_s * ll_swap + p_g * ll_guess
+  ll[ll <= 0] <- 1e-10
+  
+  -sum(log(ll))
+}
+
+# Fit per participant per condition
+cat("Fitting ML mixture models per participant...\n")
+
+ml_results <- sim_data %>%
+  group_by(subject, condition, efficiency_z) %>%
+  summarise(
+    errors = list(recall_error),
+    nt_mat = list(cbind(nt1, nt2, nt3)),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fit = map2(errors, nt_mat, function(e, nt) {
+      tryCatch({
+        result <- optim(
+          par = c(log(5), qlogis(0.65), qlogis(0.3)),
+          fn = nll_mixture3p,
+          errors = e,
+          nt_errors = nt,
+          method = "Nelder-Mead",
+          control = list(maxit = 1000)
+        )
+        tibble(
+          kappa   = exp(result$par[1]),
+          p_target = plogis(result$par[2]),
+          p_swap  = plogis(result$par[3]) * (1 - plogis(result$par[2])),
+          p_guess = 1 - plogis(result$par[2]) - plogis(result$par[3]) * (1 - plogis(result$par[2])),
+          converged = result$convergence == 0
+        )
+      }, error = function(err) {
+        tibble(kappa = NA, p_target = NA, p_swap = NA, p_guess = NA, converged = FALSE)
+      })
+    })
+  ) %>%
+  unnest(fit)
+
+cat(sprintf("Converged: %d / %d fits\n\n", sum(ml_results$converged), nrow(ml_results)))
+
+# --- 7. Test H2: Efficiency x Distractor on kappa and p_swap -----------------
+
+cat("=== H2 Tests: Efficiency x Distractor ===\n\n")
+
+# H2a: kappa ~ efficiency * distractor
+kappa_model <- lm(kappa ~ efficiency_z * condition, data = ml_results)
+cat("H2a: kappa ~ Efficiency x Distractor\n")
+print(summary(kappa_model)$coefficients)
+
+cat("\n")
+
+# H2b: p_swap ~ efficiency * distractor
+pswap_model <- lm(p_swap ~ efficiency_z * condition, data = ml_results)
+cat("H2b: p_swap ~ Efficiency x Distractor\n")
+print(summary(pswap_model)$coefficients)
+
+# --- 8. Visualization of H2 Predictions --------------------------------------
+
+p_kappa <- ml_results %>%
+  ggplot(aes(x = efficiency_z, y = kappa, color = condition)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("no_distractor" = "#27AE60", 
+                                  "distractor_15deg" = "#E74C3C"),
+                     labels = c("No Distractor", "15° Distractor")) +
+  labs(
+    title = "H2a: Precision (κ) ~ Processing Efficiency",
+    subtitle = "Steeper slope under distraction = gain modulation",
+    x = "Processing Efficiency (z)", y = "κ (precision)",
+    color = "Condition"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+p_pswap <- ml_results %>%
+  ggplot(aes(x = efficiency_z, y = p_swap, color = condition)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, linewidth = 1.2) +
+  scale_color_manual(values = c("no_distractor" = "#27AE60", 
+                                  "distractor_15deg" = "#E74C3C"),
+                     labels = c("No Distractor", "15° Distractor")) +
+  labs(
+    title = "H2b: Swap Errors ~ Processing Efficiency",
+    subtitle = "Negative slope under distraction = binding protection",
+    x = "Processing Efficiency (z)", y = "p(swap)",
+    color = "Condition"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+combined_h2 <- p_kappa + p_pswap + plot_layout(ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+
+print(combined_h2)
+
+cat("\n=== Mixture Model Pipeline Complete ===\n")
+cat("ML estimates stored in 'ml_results' data frame.\n")
+cat("For the actual study, these will be replaced with Bayesian estimates via bmm/brms.\n")
