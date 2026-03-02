@@ -1,0 +1,212 @@
+# ==============================================================================
+# 01_cfa_simulation.R
+# Confirmatory Factor Analysis: Two-Factor Attentional Control Model
+# 
+# Purpose: Simulate 6-indicator data for two latent AC factors (Inhibitory 
+#          Control + Processing Efficiency) and fit the CFA measurement model.
+#
+# Author:  Bidyasundar Baksi
+# Date:    2026-02-28
+# ==============================================================================
+
+# --- 1. Setup -----------------------------------------------------------------
+
+library(lavaan)
+library(tidyverse)
+library(patchwork)
+
+set.seed(2026)
+
+N <- 200  # Sample size
+
+# --- 2. Simulate Population Parameters ---------------------------------------
+
+# True factor loadings (moderate-to-strong, realistic for cognitive tasks)
+lambda <- c(
+  # Inhibitory Control loadings
+  stroop   = 0.65,
+  flanker  = 0.70,
+  antisacc = 0.60,
+  # Processing Efficiency loadings
+  vsearch  = 0.68,
+  capture  = 0.62,
+  changeK  = 0.72
+)
+
+# True factor correlation
+phi_12 <- 0.35  # Moderate correlation between IC and PE
+
+# Construct factor correlation matrix
+Phi <- matrix(c(1, phi_12, phi_12, 1), nrow = 2)
+
+# --- 3. Generate Latent Factor Scores ----------------------------------------
+
+# Simulate correlated latent factor scores from MVN
+library(MASS)
+eta <- mvrnorm(n = N, mu = c(0, 0), Sigma = Phi)
+colnames(eta) <- c("InhibControl", "ProcEfficiency")
+
+# --- 4. Generate Observed Indicators -----------------------------------------
+
+# Error variances: Var(e) = 1 - lambda^2 (assuming standardized factors)
+error_var <- 1 - lambda^2
+
+# Generate observed indicators: X = Lambda * eta + epsilon
+observed <- data.frame(
+  # Inhibitory Control indicators
+  stroop_interf   = lambda["stroop"]   * eta[, 1] + rnorm(N, 0, sqrt(error_var["stroop"])),
+  flanker_interf  = lambda["flanker"]  * eta[, 1] + rnorm(N, 0, sqrt(error_var["flanker"])),
+  antisacc_acc    = lambda["antisacc"] * eta[, 1] + rnorm(N, 0, sqrt(error_var["antisacc"])),
+  
+  # Processing Efficiency indicators
+  vsearch_slope   = lambda["vsearch"]  * eta[, 2] + rnorm(N, 0, sqrt(error_var["vsearch"])),
+  attcapture_cost = lambda["capture"]  * eta[, 2] + rnorm(N, 0, sqrt(error_var["capture"])),
+  changedet_K     = lambda["changeK"]  * eta[, 2] + rnorm(N, 0, sqrt(error_var["changeK"]))
+)
+
+cat("=== Simulated Data Summary ===\n")
+cat("N =", N, "participants\n")
+cat("Variables:", paste(names(observed), collapse = ", "), "\n\n")
+
+# --- 5. Specify and Fit CFA Model --------------------------------------------
+
+cfa_model <- '
+  # Measurement model
+  InhibControl   =~ stroop_interf + flanker_interf + antisacc_acc
+  ProcEfficiency =~ vsearch_slope + attcapture_cost + changedet_K
+
+  # Factor covariance (freely estimated)
+  InhibControl ~~ ProcEfficiency
+'
+
+# Fit with MLR (robust to non-normality)
+fit <- cfa(cfa_model, 
+           data       = observed, 
+           estimator  = "MLR", 
+           std.lv     = TRUE)  # Fix latent variance = 1
+
+# --- 6. Evaluate Model Fit ---------------------------------------------------
+
+cat("\n=== Model Fit Summary ===\n")
+summary(fit, fit.measures = TRUE, standardized = TRUE)
+
+# Extract key fit indices
+fit_indices <- fitMeasures(fit, c("cfi", "rmsea", "srmr", "chisq", "df", "pvalue"))
+
+cat("\n=== Key Fit Indices ===\n")
+cat(sprintf("CFI   = %.3f  (target: > .95)\n", fit_indices["cfi"]))
+cat(sprintf("RMSEA = %.3f  (target: < .06)\n", fit_indices["rmsea"]))
+cat(sprintf("SRMR  = %.3f  (target: < .08)\n", fit_indices["srmr"]))
+cat(sprintf("Chi-sq = %.2f, df = %d, p = %.3f\n", 
+            fit_indices["chisq"], fit_indices["df"], fit_indices["pvalue"]))
+
+# Evaluate: pass/fail
+cfi_pass   <- fit_indices["cfi"] > 0.95
+rmsea_pass <- fit_indices["rmsea"] < 0.06
+srmr_pass  <- fit_indices["srmr"] < 0.08
+
+cat(sprintf("\nOverall: %s\n", 
+            ifelse(all(cfi_pass, rmsea_pass, srmr_pass), 
+                   "ALL FIT CRITERIA MET", 
+                   "SOME CRITERIA NOT MET — check modification indices")))
+
+# --- 7. Standardized Factor Loadings -----------------------------------------
+
+std_loadings <- parameterEstimates(fit, standardized = TRUE) %>%
+  filter(op == "=~") %>%
+  select(lhs, rhs, est, std.all, pvalue)
+
+cat("\n=== Standardized Factor Loadings ===\n")
+print(std_loadings)
+
+# --- 8. Composite Reliability (omega) ----------------------------------------
+
+compute_omega <- function(fit, factor_name) {
+  # McDonald's omega: (sum(lambda))^2 / ((sum(lambda))^2 + sum(theta))
+  params <- parameterEstimates(fit, standardized = TRUE)
+  
+  lambdas <- params %>%
+    filter(op == "=~", lhs == factor_name) %>%
+    pull(std.all)
+  
+  # Residual variances
+  indicators <- params %>%
+    filter(op == "=~", lhs == factor_name) %>%
+    pull(rhs)
+  
+  thetas <- params %>%
+    filter(op == "~~", lhs == rhs, lhs %in% indicators) %>%
+    pull(est)
+  
+  sum_lambda <- sum(lambdas)
+  omega <- sum_lambda^2 / (sum_lambda^2 + sum(1 - lambdas^2))
+  
+  return(omega)
+}
+
+omega_IC <- compute_omega(fit, "InhibControl")
+omega_PE <- compute_omega(fit, "ProcEfficiency")
+
+cat(sprintf("\n=== Composite Reliability (omega) ===\n"))
+cat(sprintf("Inhibitory Control:   omega = %.3f  (target: > .70)\n", omega_IC))
+cat(sprintf("Processing Efficiency: omega = %.3f  (target: > .70)\n", omega_PE))
+
+# --- 9. Extract Factor Scores ------------------------------------------------
+
+ac_scores <- as.data.frame(lavPredict(fit, type = "lv"))
+colnames(ac_scores) <- c("inhibition_z", "efficiency_z")
+
+cat("\n=== Factor Score Descriptives ===\n")
+cat(sprintf("Inhibitory Control:   M = %.3f, SD = %.3f\n", 
+            mean(ac_scores$inhibition_z), sd(ac_scores$inhibition_z)))
+cat(sprintf("Processing Efficiency: M = %.3f, SD = %.3f\n", 
+            mean(ac_scores$efficiency_z), sd(ac_scores$efficiency_z)))
+cat(sprintf("Correlation (r):       %.3f\n", 
+            cor(ac_scores$inhibition_z, ac_scores$efficiency_z)))
+
+# --- 10. Visualization -------------------------------------------------------
+
+# Factor score scatter plot
+p1 <- ggplot(ac_scores, aes(x = inhibition_z, y = efficiency_z)) +
+  geom_point(alpha = 0.4, size = 2, color = "#2C3E50") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E74C3C", linewidth = 1) +
+  labs(
+    title = "Latent Factor Score Distribution",
+    subtitle = sprintf("r = %.2f (N = %d)", 
+                       cor(ac_scores$inhibition_z, ac_scores$efficiency_z), N),
+    x = "Inhibitory Control (factor score)",
+    y = "Processing Efficiency (factor score)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Loading bar chart
+loading_df <- std_loadings %>%
+  mutate(
+    indicator = rhs,
+    factor = ifelse(lhs == "InhibControl", "Inhibitory Control", "Processing Efficiency"),
+    loading = std.all
+  )
+
+p2 <- ggplot(loading_df, aes(x = reorder(indicator, loading), y = loading, fill = factor)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray40") +
+  coord_flip() +
+  scale_fill_manual(values = c("Inhibitory Control" = "#3498DB", 
+                                "Processing Efficiency" = "#E67E22")) +
+  labs(
+    title = "Standardized Factor Loadings",
+    subtitle = "Dashed line = .50 minimum threshold",
+    x = NULL, y = "Standardized Loading", fill = "Factor"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "bottom")
+
+# Combine
+combined_plot <- p1 + p2 + plot_layout(ncol = 2)
+print(combined_plot)
+
+cat("\n=== CFA Pipeline Complete ===\n")
+cat("Factor scores saved in 'ac_scores' data frame.\n")
+cat("These are used as predictors in downstream mixture model analyses.\n")
